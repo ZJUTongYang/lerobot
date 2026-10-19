@@ -17,6 +17,7 @@
 """Unit tests for ``lerobot.datasets.video_utils`` encoding functions and ``lerobot.configs.video.VideoEncoderConfig`` config class."""
 
 import json
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -586,6 +587,57 @@ class TestConcatenateVideoFiles:
                 tmp_path / "out.mp4",
                 compatibility_check=True,
             )
+
+    @require_h264
+    def test_sequential_merge_survives_very_short_clip(self, tmp_path):
+        """Regression test: appending a very short clip (e.g. an aborted
+        recording with only 2 frames) must not break the *next* append.
+
+        `aggregate_videos` (see `lerobot/datasets/aggregate.py`) builds up a
+        destination file by repeatedly calling `concatenate_video_files` with
+        just two inputs at a time: `[accumulated_dst, next_source_clip]`.
+        When a source clip in the middle of that chain is very short and the
+        clips around it contain B-frames (common for real h264 camera
+        recordings, not just a GOP-size artifact), ffmpeg's concat demuxer
+        under-estimates that clip's duration and the first packet of the
+        *following* append lands on a dts that is not strictly greater than
+        the last one already muxed. ffmpeg's own CLI tolerates this (logs
+        "Non-monotonous DTS ... changing to <previous + 1>" and continues);
+        PyAV's `OutputContainer.mux()` raised `av.error.ValueError` instead,
+        aborting the whole merge. Reproduced against real aborted-recording
+        clips from a BC-Z-derived dataset before this fix; this test
+        reproduces the same shape with synthetic clips so it does not depend
+        on any external data.
+        """
+
+        def make_clip(n_frames: int, path: Path) -> None:
+            imgs_dir = tmp_path / f"imgs_{path.stem}"
+            imgs_dir.mkdir()
+            rng = np.random.default_rng(0)
+            for i in range(n_frames):
+                frame = rng.integers(0, 255, size=(64, 96, 3), dtype=np.uint8)
+                write_image(frame, imgs_dir / f"frame-{i:06d}.png")
+            # g=30 with >= 30 frames lets libx264 insert B-frames by default,
+            # matching real camera recordings; the 2-frame "aborted" clip
+            # stays shorter than one GOP so it naturally has none.
+            cfg = RGBEncoderConfig(vcodec="h264", g=30, crf=23)
+            encode_video_frames(imgs_dir, path, fps=10, video_encoder=cfg, overwrite=True)
+
+        normal_clips = [tmp_path / f"normal_{i}.mp4" for i in range(4)]
+        for clip in normal_clips:
+            make_clip(45, clip)
+        short_clip = tmp_path / "short.mp4"
+        make_clip(2, short_clip)
+
+        clips_in_order = normal_clips[:3] + [short_clip, normal_clips[3]]
+        dst = tmp_path / "merged.mp4"
+        shutil.copy(clips_in_order[0], dst)
+        for clip in clips_in_order[1:]:
+            concatenate_video_files([dst, clip], dst, compatibility_check=True)
+
+        with av.open(str(dst)) as container:
+            total = sum(1 for _ in container.decode(video=0))
+        assert total == 45 * 4 + 2
 
 
 class TestEncoderConfigPersistence:

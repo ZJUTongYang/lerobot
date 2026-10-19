@@ -773,7 +773,21 @@ def concatenate_video_files(
             # set the time base to the input stream time base (missing in the codec context)
             stream_map[input_stream.index].time_base = input_stream.time_base
 
-    # Demux + remux packets (no re-encode)
+    # Demux + remux packets (no re-encode).
+    #
+    # The concat demuxer estimates each input file's duration (when it is not
+    # given one explicitly) to compute the timestamp offset applied to the
+    # next file in the list. For a very short input file (we have observed
+    # this with 2-frame / ~0.2s clips produced by aborted recordings) that
+    # estimate can be off by a single frame duration, so the first packet of
+    # the *following* file ends up with a dts that is not strictly greater
+    # than the last dts we already muxed. ffmpeg's own CLI tolerates this
+    # (it logs "Non-monotonous DTS ... changing to <previous dts + 1>" and
+    # keeps going); PyAV's `OutputContainer.mux()` instead raises
+    # `av.error.ValueError` for the exact same condition, aborting the whole
+    # concatenation. Apply the same one-tick correction ffmpeg's muxer would
+    # apply so this matches native ffmpeg behavior instead of failing hard.
+    last_dts_by_stream: dict[int, int] = {}
     for packet in input_container.demux():
         # Skip packets from un-mapped streams
         if packet.stream.index not in stream_map:
@@ -785,6 +799,12 @@ def concatenate_video_files(
 
         output_stream = stream_map[packet.stream.index]
         packet.stream = output_stream
+
+        last_dts = last_dts_by_stream.get(output_stream.index)
+        if last_dts is not None and packet.dts <= last_dts:
+            packet.dts = last_dts + 1
+        last_dts_by_stream[output_stream.index] = packet.dts
+
         output_container.mux(packet)
 
     input_container.close()
